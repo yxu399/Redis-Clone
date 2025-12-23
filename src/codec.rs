@@ -136,12 +136,17 @@ fn check_frame(cursor: &mut io::Cursor<&[u8]>) -> Result<()> {
             }
             Ok(())
         }
-        _ => {
+        b'a'..=b'z' | b'A'..=b'Z' => {
             // Inline command: plain text ending with \r\n
+            // Only accept alphabetic characters as valid inline commands
             // Put the byte back and read until \r\n
             cursor.set_position(cursor.position() - 1);
             get_line(cursor)?;
             Ok(())
+        }
+        _ => {
+            // Invalid type byte - this is corruption
+            Err(anyhow!("Invalid RESP type byte: {:#x}", type_byte))
         }
     }
 }
@@ -186,8 +191,9 @@ fn parse_frame<'a>(cursor: &mut io::Cursor<&'a [u8]>, src: &'a BytesMut) -> Resu
             }
             Ok(Frame::Array(out))
         }
-        _ => {
+        b'a'..=b'z' | b'A'..=b'Z' => {
             // Inline command: "PING\r\n" or "SET key value\r\n"
+            // Only accept alphabetic characters as valid inline commands
             // Put the byte back
             cursor.set_position(cursor.position() - 1);
             let line = get_line_str(cursor, src)?;
@@ -203,6 +209,10 @@ fn parse_frame<'a>(cursor: &mut io::Cursor<&'a [u8]>, src: &'a BytesMut) -> Resu
                 .collect();
 
             Ok(Frame::Array(frames))
+        }
+        _ => {
+            // Invalid type byte - this is corruption
+            Err(anyhow!("Invalid RESP type byte: {:#x}", type_byte))
         }
     }
 }

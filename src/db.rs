@@ -28,7 +28,31 @@ impl DbShard {
             expirations: HashMap::new(),
         }
     }
+    
+    // NEW: Helper to insert with eviction tracking
+    fn put_with_eviction_cleanup(&mut self, key: String, value: Bytes) {
+        // Check if we're at capacity
+        if self.storage.len() >= self.storage.cap().get() && !self.storage.contains(&key) {
+            // We're about to evict something - find what it is
+            // Unfortunately, LruCache doesn't expose peek_lru(), so we need to pop and re-insert
+            if let Some((evicted_key, evicted_val)) = self.storage.pop_lru() {
+                // Clean up its expiration
+                self.expirations.remove(&evicted_key);
+                
+                // If the evicted key is the same as what we're inserting, don't re-insert
+                if evicted_key != key {
+                    // Put it back if we're not replacing it
+                    // (This is a bit inefficient, but LruCache API is limited)
+                    // In production, you'd use a custom LRU or fork the crate
+                    self.storage.push(evicted_key, evicted_val);
+                }
+            }
+        }
+        
+        self.storage.put(key, value);
+    }
 }
+
 
 #[derive(Clone)]
 pub struct Db {
@@ -43,16 +67,21 @@ impl Db {
             shards.push(Mutex::new(DbShard::new(SHARD_CAPACITY)));
         }
         
-        let aof = Arc::new(Aof::new(&aof_path).await?);
+        // CREATE AOF BUT DON'T START BACKGROUND TASK YET
+        let (aof, activator) = Aof::new_inactive(&aof_path).await?;
 
         let db = Self {
             shards: Arc::new(shards),
-            aof,
+            aof: Arc::new(aof),
         };
         
+        // RECOVER FIRST (AOF won't write during this)
         db.recover(&aof_path).await?;
         
-        // START THE BACKGROUND CLEANER
+        // NOW activate the background writer
+        activator.activate();
+        
+        // Start background cleaner
         let db_clone = db.clone();
         tokio::spawn(async move {
             db_clone.background_purge_task().await;
@@ -84,11 +113,12 @@ impl Db {
     fn set_inner(&self, key: String, value: Bytes) {
         let idx = self.get_shard_index(&key);
         let mut shard = self.shards[idx].lock().unwrap();
-        shard.storage.put(key.clone(), value);
-        shard.expirations.remove(&key);
+        
+        // Use new method that cleans up expirations
+        shard.put_with_eviction_cleanup(key.clone(), value);
+        shard.expirations.remove(&key);  
     }
 
-    // New Method: Set Expiration
     pub fn set_expires(&self, key: String, duration: Duration) -> bool {
     let idx = self.get_shard_index(&key);
     let mut shard = self.shards[idx].lock().unwrap();
@@ -111,7 +141,6 @@ impl Db {
     false 
 }
 
-    // Updated Get: Check Expiration
     pub fn get(&self, key: &str) -> Option<Bytes> {
         let idx = self.get_shard_index(key);
         let mut shard = self.shards[idx].lock().unwrap();
@@ -126,42 +155,81 @@ impl Db {
         shard.storage.get(key).cloned()
     }
 
+    pub fn del(&self, keys: Vec<String>) -> usize {
+        let mut deleted_count = 0;
+        
+        for key in keys.iter() {
+            if self.del_inner(key) {
+                deleted_count += 1;
+            }
+        }
+        
+        // Log to AOF
+        if deleted_count > 0 {
+            let mut frame_parts = vec![Frame::Bulk(Bytes::from("DEL"))];
+            for key in keys {
+                frame_parts.push(Frame::Bulk(Bytes::from(key)));
+            }
+            self.aof.log(Frame::Array(frame_parts));
+        }
+        
+        deleted_count
+    }
+
+    // Helper: delete a single key
+    fn del_inner(&self, key: &str) -> bool {
+        let idx = self.get_shard_index(key);
+        let mut shard = self.shards[idx].lock().unwrap();
+        
+        let existed = shard.storage.pop(key).is_some();
+        if existed {
+            shard.expirations.remove(key);
+        }
+        existed
+    }
+
     // --- The Garbage Collector ---
     async fn background_purge_task(&self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        
-        loop {
-            interval.tick().await;
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    
+    loop {
+        interval.tick().await;
 
-            for shard in self.shards.iter() {
+        for shard in self.shards.iter() {
+            // Collect frames to log INSIDE the lock
+            let frames_to_log = {
                 let mut shard = shard.lock().unwrap();
                 let now = SystemTime::now();
 
-                // Find keys that are expired
-                // (Optimized: we could use a separate priority queue, but for <10k items,
-                // iterating the map is "okay" for MVP).
                 let expired_keys: Vec<String> = shard.expirations
                     .iter()
                     .filter(|(_, &time)| now > time)
                     .map(|(k, _)| k.clone())
                     .collect();
 
+                let mut frames = Vec::new();
+                
                 for key in expired_keys {
                     shard.storage.pop(&key);
                     shard.expirations.remove(&key);
                     
-                    // Crucial: Tell AOF we deleted it!
-                    // Otherwise, on replay, the key comes back.
-                    // (We construct the frame manually here to avoid deadlocking calls)
-                    let frame = Frame::Array(vec![
+                    // BUILD the frame while still holding lock
+                    frames.push(Frame::Array(vec![
                         Frame::Bulk(Bytes::from("DEL")),
                         Frame::Bulk(Bytes::from(key)),
-                    ]);
-                    self.aof.log(frame);
+                    ]));
                 }
+                
+                frames
+            }; // Lock released here
+            
+            // LOG outside the lock (safe now - we built frames inside)
+            for frame in frames_to_log {
+                self.aof.log(frame);
             }
         }
     }
+}
     
 
     async fn recover(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
@@ -211,21 +279,26 @@ impl Db {
                 Err(e) => {
                     let err_msg = e.to_string();
 
-                    // If it is an EOF error (Truncation), we stop safely.
+                    // Check if this is truly an EOF/truncation scenario
+                    // need to distinguish between:
+                    // 1. Incomplete frame at EOF (legitimate truncation) - IGNORE
+                    // 2. Invalid data that cannot be parsed (corruption) - FAIL
+
                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                         if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+                            // Incomplete frame at EOF - tolerate as truncation
                             eprintln!("Recover: Log truncated unexpectedly. Ignoring partial trailing data.");
                             break;
                         }
                     }
 
-                    // Also handle "bytes remaining on stream" which indicates partial data at EOF
+                    // Check for "bytes remaining" which also indicates truncation
                     if err_msg.contains("bytes remaining") || err_msg.contains("remaining on stream") {
                         eprintln!("Recover: Partial data at end of log. Ignoring trailing incomplete frame.");
                         break;
                     }
 
-                    // If it is any other error (Garbage), we must fail.
+                    // All other errors (invalid type byte, parse errors, bad UTF-8, etc.) are corruption
                     return Err(anyhow::anyhow!("AOF Corruption detected: {}", e));
                 }
                 _ => {}

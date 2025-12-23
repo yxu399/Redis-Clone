@@ -8,19 +8,18 @@ pub enum Command {
     Get(String),
     Set(String, Bytes),
     Expire(String, u64),
+    Del(Vec<String>),
     Ping(Option<String>),
     Unknown(String),
 }
 
 impl Command {
-    // Parse a Frame into a Command
     pub fn from_frame(frame: Frame) -> Result<Command> {
         let mut array = match frame {
             Frame::Array(array) => array,
             _ => return Err(anyhow!("Invalid command format")),
         };
 
-        // Extract the command name (e.g., "SET")
         let command_frame = array.pop_front_frame().ok_or(anyhow!("Empty command"))?;
         let command_name = match command_frame {
             Frame::Bulk(b) => String::from_utf8(b.to_vec())?.to_uppercase(),
@@ -47,8 +46,18 @@ impl Command {
                 
                 Ok(Command::Set(key, val))
             }
+            // NEW: DEL command
+            "DEL" => {
+                let mut keys = Vec::new();
+                while let Some(key_frame) = array.pop_front_frame() {
+                    keys.push(frame_to_string(key_frame)?);
+                }
+                if keys.is_empty() {
+                    return Err(anyhow!("DEL requires at least one key"));
+                }
+                Ok(Command::Del(keys))
+            }
             "PING" => {
-                // Check if there is an argument (PING vs PING "hello")
                 match array.pop_front_frame() {
                     Some(frame) => {
                         let msg = frame_to_string(frame)?;
@@ -71,7 +80,6 @@ impl Command {
         }
     }
 
-    // Execute the command against the DB
     pub fn apply(self, db: &Db) -> Frame {
         match self {
             Command::Get(key) => {
@@ -85,14 +93,16 @@ impl Command {
                 db.set(key, val);
                 Frame::Simple("OK".to_string())
             }
+            // NEW: DEL handler
+            Command::Del(keys) => {
+                let count = db.del(keys);
+                Frame::Integer(count as i64)
+            }
             Command::Ping(msg) => {
                 match msg {
                     Some(s) => Frame::Bulk(Bytes::from(s)),
                     None => Frame::Simple("PONG".to_string()),
                 }
-            }
-            Command::Unknown(cmd) => {
-                Frame::Error(format!("unknown command '{}'", cmd))
             }
             Command::Expire(key, secs) => {
                 let success = db.set_expires(key, std::time::Duration::from_secs(secs));
@@ -102,9 +112,13 @@ impl Command {
                     Frame::Integer(0)
                 }
             }
+            Command::Unknown(cmd) => {
+                Frame::Error(format!("unknown command '{}'", cmd))
+            }
         }
     }
 }
+
 
 // Helper: Vec<Frame> doesn't have pop_front, so we use a simple utility
 // Or we could reverse iter logic, but let's add a helper extension for clean code.

@@ -4,7 +4,7 @@ use tokio_util::codec::Framed;
 use futures::{SinkExt, StreamExt};
 use bytes::Bytes;
 use std::time::Duration;
-use redis_starter::{Db, RespCodec, Frame};
+use redis_clone::{Db, RespCodec, Frame, Command};
 
 // --- Test Helper ---
 // Spawns a real server instance on a random port.
@@ -29,7 +29,7 @@ async fn spawn_server() -> String {
                 let mut framed = Framed::new(socket, RespCodec);
                 while let Some(Ok(frame)) = framed.next().await {
                     // Replicating main.rs logic here
-                    let response = match redis_starter::Command::from_frame(frame) {
+                    let response = match Command::from_frame(frame) {
                         Ok(cmd) => cmd.apply(&db),
                         Err(e) => Frame::Error(e.to_string()),
                     };
