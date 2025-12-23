@@ -28,29 +28,6 @@ impl DbShard {
             expirations: HashMap::new(),
         }
     }
-    
-    // NEW: Helper to insert with eviction tracking
-    fn put_with_eviction_cleanup(&mut self, key: String, value: Bytes) {
-        // Check if we're at capacity
-        if self.storage.len() >= self.storage.cap().get() && !self.storage.contains(&key) {
-            // We're about to evict something - find what it is
-            // Unfortunately, LruCache doesn't expose peek_lru(), so we need to pop and re-insert
-            if let Some((evicted_key, evicted_val)) = self.storage.pop_lru() {
-                // Clean up its expiration
-                self.expirations.remove(&evicted_key);
-                
-                // If the evicted key is the same as what we're inserting, don't re-insert
-                if evicted_key != key {
-                    // Put it back if we're not replacing it
-                    // (This is a bit inefficient, but LruCache API is limited)
-                    // In production, you'd use a custom LRU or fork the crate
-                    self.storage.push(evicted_key, evicted_val);
-                }
-            }
-        }
-        
-        self.storage.put(key, value);
-    }
 }
 
 
@@ -113,10 +90,8 @@ impl Db {
     fn set_inner(&self, key: String, value: Bytes) {
         let idx = self.get_shard_index(&key);
         let mut shard = self.shards[idx].lock().unwrap();
-        
-        // Use new method that cleans up expirations
-        shard.put_with_eviction_cleanup(key.clone(), value);
-        shard.expirations.remove(&key);  
+        shard.storage.put(key.clone(), value);  
+        shard.expirations.remove(&key);
     }
 
     pub fn set_expires(&self, key: String, duration: Duration) -> bool {
@@ -201,6 +176,7 @@ impl Db {
                 let mut shard = shard.lock().unwrap();
                 let now = SystemTime::now();
 
+                // PART 1: Expire old keys
                 let expired_keys: Vec<String> = shard.expirations
                     .iter()
                     .filter(|(_, &time)| now > time)
@@ -208,21 +184,33 @@ impl Db {
                     .collect();
 
                 let mut frames = Vec::new();
-                
+
                 for key in expired_keys {
                     shard.storage.pop(&key);
                     shard.expirations.remove(&key);
-                    
+
                     // BUILD the frame while still holding lock
                     frames.push(Frame::Array(vec![
                         Frame::Bulk(Bytes::from("DEL")),
                         Frame::Bulk(Bytes::from(key)),
                     ]));
                 }
-                
+
+                // PART 2: Clean up orphaned expirations (from LRU evictions)
+                // This is a safety net in case evictions happen outside put_with_eviction_cleanup
+                let orphaned_keys: Vec<String> = shard.expirations
+                    .keys()
+                    .filter(|k| !shard.storage.contains(k.as_str()))
+                    .cloned()
+                    .collect();
+
+                for key in orphaned_keys {
+                    shard.expirations.remove(&key);
+                }
+
                 frames
             }; // Lock released here
-            
+
             // LOG outside the lock (safe now - we built frames inside)
             for frame in frames_to_log {
                 self.aof.log(frame);
