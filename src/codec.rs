@@ -1,8 +1,8 @@
 use crate::frame::Frame;
+use anyhow::{anyhow, Result};
 use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
-use anyhow::{anyhow, Result};
 
 pub struct RespCodec;
 
@@ -25,21 +25,23 @@ impl Decoder for RespCodec {
                 // Calculation: The check_frame advanced the cursor to the end of the frame.
                 // We know exactly how long the frame is.
                 let len = cursor.position() as usize;
-                
+
                 // RESET cursor to read the actual data
                 cursor.set_position(0);
-                
+
                 // PARSE the data
                 let frame = parse_frame(&mut cursor, src)?;
-                
+
                 // ADVANCE the buffer cursor, consuming the bytes from the stream
                 src.advance(len);
-                
+
                 Ok(Some(frame))
             }
             Err(e) => {
                 // Incomplete implies we need more bytes from the network
-                if e.downcast_ref::<io::Error>().map_or(false, |e| e.kind() == io::ErrorKind::UnexpectedEof) {
+                if e.downcast_ref::<io::Error>()
+                    .map_or(false, |e| e.kind() == io::ErrorKind::UnexpectedEof)
+                {
                     Ok(None)
                 } else {
                     Err(e) // Real data corruption error
@@ -204,7 +206,8 @@ fn parse_frame<'a>(cursor: &mut io::Cursor<&'a [u8]>, src: &'a BytesMut) -> Resu
                 return Err(anyhow!("Empty inline command"));
             }
 
-            let frames: Vec<Frame> = parts.into_iter()
+            let frames: Vec<Frame> = parts
+                .into_iter()
                 .map(|s| Frame::Bulk(Bytes::from(s.to_string())))
                 .collect();
 
@@ -264,7 +267,7 @@ mod tests {
         let mut codec = RespCodec;
         let mut buf = BytesMut::from("$6\r\nfoobar\r\n");
         let res = codec.decode(&mut buf).unwrap().unwrap();
-        
+
         if let Frame::Bulk(b) = res {
             assert_eq!(b, "foobar");
         } else {
@@ -277,7 +280,7 @@ mod tests {
         let mut codec = RespCodec;
         let mut buf = BytesMut::from("*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
         let res = codec.decode(&mut buf).unwrap().unwrap();
-        
+
         if let Frame::Array(frames) = res {
             assert_eq!(frames.len(), 2);
             assert_eq!(frames[0], Frame::Bulk(Bytes::from("foo")));
@@ -292,7 +295,7 @@ mod tests {
         let mut codec = RespCodec;
         // Send half a command
         let mut buf = BytesMut::from("*2\r\n$3\r\nfoo\r\n");
-        
+
         // Should return Ok(None) -> "I need more bytes"
         let res = codec.decode(&mut buf).unwrap();
         assert!(res.is_none());
@@ -300,7 +303,7 @@ mod tests {
         // Add the rest
         buf.extend_from_slice(b"$3\r\nbar\r\n");
         let res = codec.decode(&mut buf).unwrap().unwrap();
-        
+
         if let Frame::Array(frames) = res {
             assert_eq!(frames.len(), 2);
         } else {

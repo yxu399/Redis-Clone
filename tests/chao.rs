@@ -1,7 +1,7 @@
+use bytes::Bytes;
+use redis_clone::Db;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use redis_clone::Db;
-use bytes::Bytes;
 
 // Helper to generate temp filename
 fn temp_aof() -> String {
@@ -20,10 +20,12 @@ async fn test_aof_corruption_handling() {
             .open(&path)
             .await
             .unwrap();
-            
+
         // "SET valid 123"
-        file.write_all(b"*3\r\n$3\r\nSET\r\n$5\r\nvalid\r\n$3\r\n123\r\n").await.unwrap();
-        
+        file.write_all(b"*3\r\n$3\r\nSET\r\n$5\r\nvalid\r\n$3\r\n123\r\n")
+            .await
+            .unwrap();
+
         // 2. Append GARBAGE bytes (Simulate disk corruption)
         file.write_all(b"@@@GARBAGE_DATA###").await.unwrap();
         file.flush().await.unwrap();
@@ -34,7 +36,7 @@ async fn test_aof_corruption_handling() {
 
     // 4. Verify: It should FAIL (Return Err)
     assert!(result.is_err(), "DB should fail to start on corrupted AOF");
-    
+
     // Optional: Check error message contains "Corruption"
     let err_msg = result.err().unwrap().to_string();
     assert!(err_msg.contains("Corruption") || err_msg.contains("Invalid frame"));
@@ -54,12 +56,16 @@ async fn test_partial_write_recovery() {
             .unwrap();
 
         // Cmd 1: "SET safe 1" (Complete)
-        file.write_all(b"*3\r\n$3\r\nSET\r\n$4\r\nsafe\r\n$1\r\n1\r\n").await.unwrap();
+        file.write_all(b"*3\r\n$3\r\nSET\r\n$4\r\nsafe\r\n$1\r\n1\r\n")
+            .await
+            .unwrap();
 
         // Cmd 2: "SET broken 2" ... CUT OFF IN MIDDLE
         // We write the array header *3, the command SET, the key broken... but NO VALUE
-        file.write_all(b"*3\r\n$3\r\nSET\r\n$6\r\nbroken\r\n").await.unwrap();
-        
+        file.write_all(b"*3\r\n$3\r\nSET\r\n$6\r\nbroken\r\n")
+            .await
+            .unwrap();
+
         file.flush().await.unwrap();
     }
 

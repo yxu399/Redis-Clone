@@ -1,19 +1,19 @@
-use std::sync::{Arc, Mutex};
+use crate::aof::Aof;
+use crate::codec::RespCodec;
+use crate::frame::Frame;
+use bytes::Bytes;
+use futures::StreamExt;
+use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime}; // <--- Need Duration
-use bytes::Bytes;
-use lru::LruCache;
-use crate::aof::Aof;
-use crate::frame::Frame;
 use tokio::fs::File;
 use tokio_util::codec::FramedRead;
-use crate::codec::RespCodec;
-use futures::StreamExt;
-use std::path::Path;
 
 const SHARD_COUNT: usize = 16;
-const SHARD_CAPACITY: usize = 10000; 
+const SHARD_CAPACITY: usize = 10000;
 
 struct DbShard {
     storage: LruCache<String, Bytes>,
@@ -30,7 +30,6 @@ impl DbShard {
     }
 }
 
-
 #[derive(Clone)]
 pub struct Db {
     shards: Arc<Vec<Mutex<DbShard>>>,
@@ -43,7 +42,7 @@ impl Db {
         for _ in 0..SHARD_COUNT {
             shards.push(Mutex::new(DbShard::new(SHARD_CAPACITY)));
         }
-        
+
         // CREATE AOF BUT DON'T START BACKGROUND TASK YET
         let (aof, activator) = Aof::new_inactive(&aof_path).await?;
 
@@ -51,13 +50,13 @@ impl Db {
             shards: Arc::new(shards),
             aof: Arc::new(aof),
         };
-        
+
         // RECOVER FIRST (AOF won't write during this)
         db.recover(&aof_path).await?;
-        
+
         // NOW activate the background writer
         activator.activate();
-        
+
         // Start background cleaner
         let db_clone = db.clone();
         tokio::spawn(async move {
@@ -90,31 +89,31 @@ impl Db {
     fn set_inner(&self, key: String, value: Bytes) {
         let idx = self.get_shard_index(&key);
         let mut shard = self.shards[idx].lock().unwrap();
-        shard.storage.put(key.clone(), value);  
+        shard.storage.put(key.clone(), value);
         shard.expirations.remove(&key);
     }
 
     pub fn set_expires(&self, key: String, duration: Duration) -> bool {
-    let idx = self.get_shard_index(&key);
-    let mut shard = self.shards[idx].lock().unwrap();
-    
-    if shard.storage.contains(&key) {
-        let deadline = SystemTime::now() + duration;
-        shard.expirations.insert(key.clone(), deadline); // Clone key for the map
-        
-        // Log to AOF
-        let frame = Frame::Array(vec![
-            Frame::Bulk(Bytes::from("EXPIRE")),
-            Frame::Bulk(Bytes::from(key)),
-            Frame::Bulk(Bytes::from(duration.as_secs().to_string())),
-        ]);
-        self.aof.log(frame);
-        
-        return true; 
+        let idx = self.get_shard_index(&key);
+        let mut shard = self.shards[idx].lock().unwrap();
+
+        if shard.storage.contains(&key) {
+            let deadline = SystemTime::now() + duration;
+            shard.expirations.insert(key.clone(), deadline); // Clone key for the map
+
+            // Log to AOF
+            let frame = Frame::Array(vec![
+                Frame::Bulk(Bytes::from("EXPIRE")),
+                Frame::Bulk(Bytes::from(key)),
+                Frame::Bulk(Bytes::from(duration.as_secs().to_string())),
+            ]);
+            self.aof.log(frame);
+
+            return true;
+        }
+
+        false
     }
-    
-    false 
-}
 
     pub fn get(&self, key: &str) -> Option<Bytes> {
         let idx = self.get_shard_index(key);
@@ -132,13 +131,13 @@ impl Db {
 
     pub fn del(&self, keys: Vec<String>) -> usize {
         let mut deleted_count = 0;
-        
+
         for key in keys.iter() {
             if self.del_inner(key) {
                 deleted_count += 1;
             }
         }
-        
+
         // Log to AOF
         if deleted_count > 0 {
             let mut frame_parts = vec![Frame::Bulk(Bytes::from("DEL"))];
@@ -147,7 +146,7 @@ impl Db {
             }
             self.aof.log(Frame::Array(frame_parts));
         }
-        
+
         deleted_count
     }
 
@@ -155,7 +154,7 @@ impl Db {
     fn del_inner(&self, key: &str) -> bool {
         let idx = self.get_shard_index(key);
         let mut shard = self.shards[idx].lock().unwrap();
-        
+
         let existed = shard.storage.pop(key).is_some();
         if existed {
             shard.expirations.remove(key);
@@ -165,60 +164,61 @@ impl Db {
 
     // --- The Garbage Collector ---
     async fn background_purge_task(&self) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    
-    loop {
-        interval.tick().await;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
 
-        for shard in self.shards.iter() {
-            // Collect frames to log INSIDE the lock
-            let frames_to_log = {
-                let mut shard = shard.lock().unwrap();
-                let now = SystemTime::now();
+        loop {
+            interval.tick().await;
 
-                // PART 1: Expire old keys
-                let expired_keys: Vec<String> = shard.expirations
-                    .iter()
-                    .filter(|(_, &time)| now > time)
-                    .map(|(k, _)| k.clone())
-                    .collect();
+            for shard in self.shards.iter() {
+                // Collect frames to log INSIDE the lock
+                let frames_to_log = {
+                    let mut shard = shard.lock().unwrap();
+                    let now = SystemTime::now();
 
-                let mut frames = Vec::new();
+                    // PART 1: Expire old keys
+                    let expired_keys: Vec<String> = shard
+                        .expirations
+                        .iter()
+                        .filter(|(_, &time)| now > time)
+                        .map(|(k, _)| k.clone())
+                        .collect();
 
-                for key in expired_keys {
-                    shard.storage.pop(&key);
-                    shard.expirations.remove(&key);
+                    let mut frames = Vec::new();
 
-                    // BUILD the frame while still holding lock
-                    frames.push(Frame::Array(vec![
-                        Frame::Bulk(Bytes::from("DEL")),
-                        Frame::Bulk(Bytes::from(key)),
-                    ]));
+                    for key in expired_keys {
+                        shard.storage.pop(&key);
+                        shard.expirations.remove(&key);
+
+                        // BUILD the frame while still holding lock
+                        frames.push(Frame::Array(vec![
+                            Frame::Bulk(Bytes::from("DEL")),
+                            Frame::Bulk(Bytes::from(key)),
+                        ]));
+                    }
+
+                    // PART 2: Clean up orphaned expirations (from LRU evictions)
+                    // This is a safety net in case evictions happen outside put_with_eviction_cleanup
+                    let orphaned_keys: Vec<String> = shard
+                        .expirations
+                        .keys()
+                        .filter(|k| !shard.storage.contains(k.as_str()))
+                        .cloned()
+                        .collect();
+
+                    for key in orphaned_keys {
+                        shard.expirations.remove(&key);
+                    }
+
+                    frames
+                }; // Lock released here
+
+                // LOG outside the lock (safe now - we built frames inside)
+                for frame in frames_to_log {
+                    self.aof.log(frame);
                 }
-
-                // PART 2: Clean up orphaned expirations (from LRU evictions)
-                // This is a safety net in case evictions happen outside put_with_eviction_cleanup
-                let orphaned_keys: Vec<String> = shard.expirations
-                    .keys()
-                    .filter(|k| !shard.storage.contains(k.as_str()))
-                    .cloned()
-                    .collect();
-
-                for key in orphaned_keys {
-                    shard.expirations.remove(&key);
-                }
-
-                frames
-            }; // Lock released here
-
-            // LOG outside the lock (safe now - we built frames inside)
-            for frame in frames_to_log {
-                self.aof.log(frame);
             }
         }
     }
-}
-    
 
     async fn recover(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let file = match File::open(path).await {
@@ -236,14 +236,19 @@ impl Db {
 
                         match cmd_str.as_str() {
                             "SET" => {
-                                if let (Some(Frame::Bulk(k)), Some(Frame::Bulk(v))) = (cmd_parts.get(1), cmd_parts.get(2)) {
+                                if let (Some(Frame::Bulk(k)), Some(Frame::Bulk(v))) =
+                                    (cmd_parts.get(1), cmd_parts.get(2))
+                                {
                                     self.set_inner(String::from_utf8(k.to_vec())?, v.clone());
                                 }
                             }
                             "EXPIRE" => {
-                                if let (Some(Frame::Bulk(k)), Some(Frame::Bulk(sec_bytes))) = (cmd_parts.get(1), cmd_parts.get(2)) {
+                                if let (Some(Frame::Bulk(k)), Some(Frame::Bulk(sec_bytes))) =
+                                    (cmd_parts.get(1), cmd_parts.get(2))
+                                {
                                     let key = String::from_utf8(k.to_vec())?;
-                                    let secs = String::from_utf8(sec_bytes.to_vec())?.parse::<u64>()?;
+                                    let secs =
+                                        String::from_utf8(sec_bytes.to_vec())?.parse::<u64>()?;
 
                                     let idx = self.get_shard_index(&key);
                                     let mut shard = self.shards[idx].lock().unwrap();
@@ -281,7 +286,9 @@ impl Db {
                     }
 
                     // Check for "bytes remaining" which also indicates truncation
-                    if err_msg.contains("bytes remaining") || err_msg.contains("remaining on stream") {
+                    if err_msg.contains("bytes remaining")
+                        || err_msg.contains("remaining on stream")
+                    {
                         eprintln!("Recover: Partial data at end of log. Ignoring trailing incomplete frame.");
                         break;
                     }
@@ -309,7 +316,7 @@ mod tests {
         // 2. Fill it up
         shard.storage.put("a".to_string(), Bytes::from("1"));
         shard.storage.put("b".to_string(), Bytes::from("2"));
-        
+
         // 3. Insert one more -> Should evict "a" (Least Recently Used)
         shard.storage.put("c".to_string(), Bytes::from("3"));
 
@@ -322,11 +329,13 @@ mod tests {
     #[test]
     fn test_passive_expiration() {
         let mut shard = DbShard::new(10);
-        
+
         // 1. Set key with 10ms expiration
         let key = "temp".to_string();
         shard.storage.put(key.clone(), Bytes::from("val"));
-        shard.expirations.insert(key.clone(), SystemTime::now() + Duration::from_millis(10));
+        shard
+            .expirations
+            .insert(key.clone(), SystemTime::now() + Duration::from_millis(10));
 
         // 2. Access immediately -> Should exist
         // Note: We simulate the 'get' logic manually to avoid locking complications in unit tests

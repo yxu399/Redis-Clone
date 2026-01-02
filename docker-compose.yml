@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  node1:
+    build: .
+    container_name: raft-node-1
+    command:
+      - "--id"
+      - "1"
+      - "--peers"
+      - "node2:50051,node3:50051"
+      - "--grpc-addr"
+      - "0.0.0.0:50051"
+      - "--redis-addr"
+      - "0.0.0.0:6379"
+    ports:
+      - "6379:6379"   # Host Port 6379 -> Container Port 6379
+      - "50051:50051" # Host Port 50051 -> Container Port 50051
+
+  node2:
+    build: .
+    container_name: raft-node-2
+    command:
+      - "--id"
+      - "2"
+      - "--peers"
+      - "node1:50051,node3:50051"
+      - "--grpc-addr"
+      - "0.0.0.0:50051"
+      - "--redis-addr"
+      - "0.0.0.0:6379"
+    ports:
+      - "6380:6379"   # Host Port 6380 -> Container Port 6379
+      - "50052:50051"
+
+  node3:
+    build: .
+    container_name: raft-node-3
+    command:
+      - "--id"
+      - "3"
+      - "--peers"
+      - "node1:50051,node2:50051"
+      - "--grpc-addr"
+      - "0.0.0.0:50051"
+      - "--redis-addr"
+      - "0.0.0.0:6379"
+    ports:
+      - "6381:6379"   # Host Port 6381 -> Container Port 6379
+      - "50053:50051"

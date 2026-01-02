@@ -1,14 +1,14 @@
-use redis_clone::Db;
 use bytes::Bytes;
+use redis_clone::Db;
 use std::sync::Arc;
 
 #[tokio::test]
 async fn test_concurrent_operations() {
     let aof = format!("test_concurrent_{}.aof", uuid::Uuid::new_v4());
     let db = Arc::new(Db::new(&aof).await.unwrap());
-    
+
     let mut handles = vec![];
-    
+
     // Spawn 10 concurrent writers
     for i in 0..10 {
         let db = Arc::clone(&db);
@@ -21,12 +21,12 @@ async fn test_concurrent_operations() {
         });
         handles.push(handle);
     }
-    
+
     // Wait for all writers
     for handle in handles {
         handle.await.unwrap();
     }
-    
+
     // Verify all keys exist
     for i in 0..10 {
         for j in 0..100 {
@@ -35,7 +35,7 @@ async fn test_concurrent_operations() {
             assert_eq!(db.get(&key), Some(Bytes::from(expected)));
         }
     }
-    
+
     std::fs::remove_file(&aof).ok();
 }
 
@@ -43,14 +43,14 @@ async fn test_concurrent_operations() {
 async fn test_concurrent_read_write() {
     let aof = format!("test_rw_{}.aof", uuid::Uuid::new_v4());
     let db = Arc::new(Db::new(&aof).await.unwrap());
-    
+
     // Pre-populate
     for i in 0..100 {
         db.set(format!("key{}", i), Bytes::from(format!("value{}", i)));
     }
-    
+
     let mut handles = vec![];
-    
+
     // Spawn readers
     for _ in 0..5 {
         let db = Arc::clone(&db);
@@ -62,7 +62,7 @@ async fn test_concurrent_read_write() {
         });
         handles.push(handle);
     }
-    
+
     // Spawn writers
     for i in 0..5 {
         let db = Arc::clone(&db);
@@ -74,11 +74,11 @@ async fn test_concurrent_read_write() {
         });
         handles.push(handle);
     }
-    
+
     // Wait for completion
     for handle in handles {
         handle.await.unwrap();
     }
-    
+
     std::fs::remove_file(&aof).ok();
 }

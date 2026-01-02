@@ -1,11 +1,11 @@
-use crate::frame::Frame;
 use crate::codec::RespCodec;
+use crate::frame::Frame;
+use anyhow::Result;
+use futures::sink::SinkExt; // for .send()
+use std::path::Path;
 use tokio::fs::OpenOptions;
 use tokio::sync::mpsc;
 use tokio_util::codec::FramedWrite;
-use futures::sink::SinkExt; // for .send()
-use std::path::Path;
-use anyhow::Result;
 
 pub struct Aof {
     // We only need the Sender to push generic frames (like SET k v)
@@ -15,7 +15,7 @@ pub struct Aof {
 impl Aof {
     pub async fn new_inactive(path: impl AsRef<Path>) -> Result<(Self, AofActivator)> {
         let path = path.as_ref().to_owned();
-        
+
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -24,17 +24,13 @@ impl Aof {
             .await?;
 
         let (tx, rx) = mpsc::channel(1000);
-        
+
         // Return both the Aof and the receiver to activate later
-        Ok((
-            Aof { tx },
-            AofActivator { rx, file }
-        ))
+        Ok((Aof { tx }, AofActivator { rx, file }))
     }
 
-
     pub fn log(&self, frame: Frame) {
-        let _ = self.tx.try_send(frame); 
+        let _ = self.tx.try_send(frame);
     }
 }
 

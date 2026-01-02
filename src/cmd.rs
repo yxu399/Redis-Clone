@@ -1,7 +1,7 @@
-use crate::frame::Frame;
 use crate::db::Db;
-use bytes::Bytes;
+use crate::frame::Frame;
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 
 // The executable actions our server supports
 pub enum Command {
@@ -35,15 +35,17 @@ impl Command {
             }
             "SET" => {
                 let key_frame = array.pop_front_frame().ok_or(anyhow!("SET requires key"))?;
-                let val_frame = array.pop_front_frame().ok_or(anyhow!("SET requires value"))?;
-                
+                let val_frame = array
+                    .pop_front_frame()
+                    .ok_or(anyhow!("SET requires value"))?;
+
                 let key = frame_to_string(key_frame)?;
                 let val = match val_frame {
                     Frame::Bulk(b) => b,
                     Frame::Simple(s) => Bytes::from(s),
                     _ => return Err(anyhow!("Invalid value type")),
                 };
-                
+
                 Ok(Command::Set(key, val))
             }
             // NEW: DEL command
@@ -57,23 +59,27 @@ impl Command {
                 }
                 Ok(Command::Del(keys))
             }
-            "PING" => {
-                match array.pop_front_frame() {
-                    Some(frame) => {
-                        let msg = frame_to_string(frame)?;
-                        Ok(Command::Ping(Some(msg)))
-                    },
-                    None => Ok(Command::Ping(None)),
+            "PING" => match array.pop_front_frame() {
+                Some(frame) => {
+                    let msg = frame_to_string(frame)?;
+                    Ok(Command::Ping(Some(msg)))
                 }
-            }
+                None => Ok(Command::Ping(None)),
+            },
             "EXPIRE" => {
-                let key_frame = array.pop_front_frame().ok_or(anyhow!("EXPIRE requires key"))?;
-                let sec_frame = array.pop_front_frame().ok_or(anyhow!("EXPIRE requires seconds"))?;
-                
+                let key_frame = array
+                    .pop_front_frame()
+                    .ok_or(anyhow!("EXPIRE requires key"))?;
+                let sec_frame = array
+                    .pop_front_frame()
+                    .ok_or(anyhow!("EXPIRE requires seconds"))?;
+
                 let key = frame_to_string(key_frame)?;
                 let secs_str = frame_to_string(sec_frame)?;
-                let secs = secs_str.parse::<u64>().map_err(|_| anyhow!("Invalid integer for seconds"))?;
-                
+                let secs = secs_str
+                    .parse::<u64>()
+                    .map_err(|_| anyhow!("Invalid integer for seconds"))?;
+
                 Ok(Command::Expire(key, secs))
             }
             unknown => Ok(Command::Unknown(unknown.to_string())),
@@ -98,12 +104,10 @@ impl Command {
                 let count = db.del(keys);
                 Frame::Integer(count as i64)
             }
-            Command::Ping(msg) => {
-                match msg {
-                    Some(s) => Frame::Bulk(Bytes::from(s)),
-                    None => Frame::Simple("PONG".to_string()),
-                }
-            }
+            Command::Ping(msg) => match msg {
+                Some(s) => Frame::Bulk(Bytes::from(s)),
+                None => Frame::Simple("PONG".to_string()),
+            },
             Command::Expire(key, secs) => {
                 let success = db.set_expires(key, std::time::Duration::from_secs(secs));
                 if success {
@@ -112,13 +116,10 @@ impl Command {
                     Frame::Integer(0)
                 }
             }
-            Command::Unknown(cmd) => {
-                Frame::Error(format!("unknown command '{}'", cmd))
-            }
+            Command::Unknown(cmd) => Frame::Error(format!("unknown command '{}'", cmd)),
         }
     }
 }
-
 
 // Helper: Vec<Frame> doesn't have pop_front, so we use a simple utility
 // Or we could reverse iter logic, but let's add a helper extension for clean code.
@@ -132,7 +133,7 @@ impl ArrayExt for Vec<Frame> {
             None
         } else {
             // This is O(N) but fine for short command arrays (length 2 or 3)
-            Some(self.remove(0)) 
+            Some(self.remove(0))
         }
     }
 }
@@ -156,13 +157,13 @@ mod tests {
             Frame::Bulk(Bytes::from("key")),
             Frame::Bulk(Bytes::from("value")),
         ]);
-        
+
         let cmd = Command::from_frame(frame).unwrap();
         match cmd {
             Command::Set(k, v) => {
                 assert_eq!(k, "key");
                 assert_eq!(v, "value");
-            },
+            }
             _ => panic!("Expected Set command"),
         }
     }
@@ -173,7 +174,7 @@ mod tests {
             Frame::Bulk(Bytes::from("gEt")), // Mixed case
             Frame::Bulk(Bytes::from("key")),
         ]);
-        
+
         let cmd = Command::from_frame(frame).unwrap();
         match cmd {
             Command::Get(k) => assert_eq!(k, "key"),
